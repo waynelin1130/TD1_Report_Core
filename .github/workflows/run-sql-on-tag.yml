@@ -1,0 +1,227 @@
+name: Run SQL migrations on release tag
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: sql-migration-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  run-sql-migrations:
+    runs-on: [self-hosted, linux, x64, vpn]
+
+    permissions:
+      contents: read
+
+    env:
+      TAG_NAME: ${{ github.ref_name }}
+      SQL_ROOT: TD1_Report_Core/SQL
+
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_PORT: ${{ secrets.DB_PORT }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${TAG_NAME}"
+          echo "Current tag: ${TAG}"
+
+          # 允許：
+          # v1.2.3
+          # v1.2.3-hotfix.1
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-hotfix\.[0-9]+)?$ ]]; then
+            echo "Tag format not allowed: $TAG"
+            exit 1
+          fi
+
+          # 額外保險：不允許 dev tag
+          if [[ "$TAG" =~ -dev(\.[0-9]+)?$ ]]; then
+            echo "dev tag is not allowed: $TAG"
+            exit 1
+          fi
+
+      - name: Find previous valid tag
+        id: prev_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_TAG="${TAG_NAME}"
+
+          mapfile -t TAGS < <(
+            git tag --sort=version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-hotfix\.[0-9]+)?$' \
+            | grep -Ev -- '-dev(\.[0-9]+)?$'
+          )
+
+          echo "All valid tags:"
+          printf '%s\n' "${TAGS[@]}"
+
+          PREV_TAG=""
+          for i in "${!TAGS[@]}"; do
+            if [[ "${TAGS[$i]}" == "$CURRENT_TAG" ]]; then
+              if [[ "$i" -gt 0 ]]; then
+                PREV_TAG="${TAGS[$((i-1))]}"
+              fi
+              break
+            fi
+          done
+
+          if [[ -z "${PREV_TAG}" ]]; then
+            echo "No previous valid tag found."
+            echo "previous_tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Previous tag: ${PREV_TAG}"
+            echo "previous_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect changed SQL date folders
+        id: changed_sql
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_TAG="${TAG_NAME}"
+          PREV_TAG="${{ steps.prev_tag.outputs.previous_tag }}"
+          SQL_ROOT="${SQL_ROOT}"
+
+          if [[ ! -d "$SQL_ROOT" ]]; then
+            echo "SQL root not found: $SQL_ROOT"
+            exit 1
+          fi
+
+          if [[ -z "$PREV_TAG" ]]; then
+            echo "First valid tag release, use current tag files only."
+            mapfile -t DATE_DIRS < <(
+              find "$SQL_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+              | grep -E '^[0-9]{8}$' \
+              | sort
+            )
+          else
+            echo "Comparing ${PREV_TAG}..${CURRENT_TAG}"
+
+            mapfile -t DATE_DIRS < <(
+              git diff --name-only "${PREV_TAG}" "${CURRENT_TAG}" -- "${SQL_ROOT}" \
+              | awk -F/ '
+                  $1 == "TD1_Report_Core" && $2 == "SQL" && $3 ~ /^[0-9]{8}$/ {
+                    print $3
+                  }
+                ' \
+              | sort -u
+            )
+          fi
+
+          if [[ "${#DATE_DIRS[@]}" -eq 0 ]]; then
+            echo "No changed SQL date folders."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "${DATE_DIRS[@]}" > changed_date_dirs.txt
+
+          echo "Changed SQL date folders:"
+          cat changed_date_dirs.txt
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Test DB TCP connection
+        if: steps.changed_sql.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Testing TCP connection to ${DB_HOST}:${DB_PORT}"
+          timeout 5 bash -c "</dev/tcp/${DB_HOST}/${DB_PORT}"
+          echo "TCP connection OK"
+
+      - name: Test SQL login
+        if: steps.changed_sql.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PATH="$PATH:/opt/mssql-tools18/bin"
+
+          sqlcmd \
+            -S "${DB_HOST},${DB_PORT}" \
+            -d "${DB_NAME}" \
+            -U "${DB_USER}" \
+            -P "${DB_PASSWORD}" \
+            -C \
+            -b \
+            -Q "SELECT @@SERVERNAME AS ServerName, DB_NAME() AS DatabaseName"
+
+      - name: Execute SQL migrations
+        if: steps.changed_sql.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PATH="$PATH:/opt/mssql-tools18/bin"
+
+          if ! command -v sqlcmd >/dev/null 2>&1; then
+            echo "sqlcmd not found"
+            exit 1
+          fi
+
+          mapfile -t CHANGED_DATE_DIRS < changed_date_dirs.txt
+
+          for date_dir in "${CHANGED_DATE_DIRS[@]}"; do
+            BASE_DIR="${SQL_ROOT}/${date_dir}"
+
+            echo "========================================"
+            echo "Processing date folder: ${date_dir}"
+            echo "========================================"
+
+            # 先執行 DDL
+            if [[ -d "${BASE_DIR}/DDL" ]]; then
+              mapfile -t DDL_FILES < <(
+                find "${BASE_DIR}/DDL" -maxdepth 1 -type f -name "*.sql" | sort
+              )
+
+              for file in "${DDL_FILES[@]}"; do
+                echo "Running DDL: ${file}"
+                sqlcmd \
+                  -S "${DB_HOST},${DB_PORT}" \
+                  -d "${DB_NAME}" \
+                  -U "${DB_USER}" \
+                  -P "${DB_PASSWORD}" \
+                  -C \
+                  -b \
+                  -i "${file}" < /dev/null
+              done
+            fi
+
+            # 再執行 DML
+            if [[ -d "${BASE_DIR}/DML" ]]; then
+              mapfile -t DML_FILES < <(
+                find "${BASE_DIR}/DML" -maxdepth 1 -type f -name "*.sql" | sort
+              )
+
+              for file in "${DML_FILES[@]}"; do
+                echo "Running DML: ${file}"
+                sqlcmd \
+                  -S "${DB_HOST},${DB_PORT}" \
+                  -d "${DB_NAME}" \
+                  -U "${DB_USER}" \
+                  -P "${DB_PASSWORD}" \
+                  -C \
+                  -b \
+                  -i "${file}" < /dev/null
+              done
+            fi
+          done

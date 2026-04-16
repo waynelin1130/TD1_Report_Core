@@ -1,0 +1,52 @@
+<Project>
+  <PropertyGroup>
+    <!-- 版本 -->
+    <MajorVersion>0</MajorVersion>
+    <MinorVersion>6</MinorVersion>
+    <PatchVersion>2</PatchVersion>
+
+    <!-- 後綴：dev / hotfix -->
+    <VersionSuffix></VersionSuffix>
+
+    <!-- 第幾版 dev / hotfix -->
+    <SuffixVersion Condition="'$(SuffixVersion)' == ''">0</SuffixVersion>
+
+    <BaseVersion>$(MajorVersion).$(MinorVersion).$(PatchVersion)</BaseVersion>
+
+    <!-- NuGet package version -->
+    <PackageVersion Condition="'$(VersionSuffix)' == ''">$(BaseVersion)</PackageVersion>
+    <PackageVersion Condition="'$(VersionSuffix)' != ''">$(BaseVersion)-$(VersionSuffix).$(SuffixVersion)</PackageVersion>
+
+    <!-- 套件版本 -->
+    <Version>$(PackageVersion)</Version>
+
+    <!-- 組件版本固定四碼 -->
+    <AssemblyVersion>$(MajorVersion).$(MinorVersion).$(PatchVersion).0</AssemblyVersion>
+    <FileVersion>$(MajorVersion).$(MinorVersion).$(PatchVersion).0</FileVersion>
+
+    <!-- 顯示版本 -->
+    <InformationalVersion Condition="'$(VersionSuffix)' == ''">$(BaseVersion)</InformationalVersion>
+    <InformationalVersion Condition="'$(VersionSuffix)' != ''">$(BaseVersion)-$(VersionSuffix).$(SuffixVersion)</InformationalVersion>
+
+    <Authors>TPDRG TECHNOLOGY INC</Authors>
+    <Company>TPDRG TECHNOLOGY INC</Company>
+    <Product>TD1_Report_Core</Product>
+
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <PackageOutputPath>$(MSBuildThisFileDirectory)nupkgs</PackageOutputPath>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <Target Name="ValidateVersionSettings" BeforeTargets="Build;Pack">
+    <Error
+      Condition="'$(VersionSuffix)' != '' and '$(SuffixVersion)' == '0'"
+      Text="當 VersionSuffix 有值時，SuffixVersion 不可為 0。例如：0.5.1-dev.1、0.5.1-hotfix.1" />
+  </Target>
+</Project>
